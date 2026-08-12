@@ -1285,7 +1285,6 @@ static int eie_probe(struct usb_interface *interface, const struct usb_device_id
 	eie->udev = interface_to_usbdev(interface);
 	eie->card = card;
 	eie->card_index = card_index;
-
 	spin_lock_init(&eie->lock);
 	init_waitqueue_head(&eie->urbs_flow_wait);
 
@@ -1308,9 +1307,9 @@ static int eie_probe(struct usb_interface *interface, const struct usb_device_id
 
 	/* Setup card info to appear as standard USB Audio device */
 	snd_card_set_dev(card, &interface->dev);
-	strcpy(card->driver, "USB-Audio");
-	strcpy(card->shortname, "AKAI EIE Pro");
-	snprintf(card->longname, sizeof(card->longname),
+	(void)strcpy(card->driver, "USB-Audio");
+	(void)strcpy(card->shortname, "AKAI EIE Pro");
+	(void)snprintf(card->longname, sizeof(card->longname),
 		 "AKAI EIE Pro at %s", dev_name(&eie->udev->dev));
 
 	err = snd_pcm_new(card, "USB Audio", 0, 1, 1, &eie->pcm);
@@ -1324,7 +1323,7 @@ static int eie_probe(struct usb_interface *interface, const struct usb_device_id
 
 	/* Pre-allocate buffers for both streams */
 	snd_pcm_lib_preallocate_pages_for_all(eie->pcm, SNDRV_DMA_TYPE_VMALLOC,
-					       NULL, 0, 512*1024);
+		   NULL, 0, 512*1024);
 
 	/* Add minimal mixer control for browser volume detection */
 	{
@@ -1336,6 +1335,8 @@ static int eie_probe(struct usb_interface *interface, const struct usb_device_id
 			.put = eie_capture_volume_put,
 		};
 		err = snd_ctl_add(card, snd_ctl_new1(&capture_volume, eie));
+		if (err < 0)
+			goto probe_err;
 		if (err < 0) {
 			dev_warn(&eie->udev->dev, "Failed to add capture volume: %d", err);
 		}
