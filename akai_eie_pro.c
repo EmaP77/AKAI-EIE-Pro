@@ -325,11 +325,11 @@ static int fill_playback_urb(struct eie_playback_urb *epu)
 	struct urb *urb = epu->urb;
 	unsigned int frames_wanted = calc_frames_wanted(eie);
 	unsigned int frames_elapsed = atomic_xchg(&eie->frames_elapsed, 0);
-	unsigned int frames_filled = 0;
+	/* frames_filled removed; kept frame_bytes */
 	unsigned int frame_bytes = BYTES_PER_FRAME;
 	unsigned int bytes_wanted;
 	unsigned char *start;
-	int i;
+	/* i removed */
 
 	if (eie->play_substream && eie->play_substream->runtime)
 		frame_bytes = eie_frame_bytes(eie->play_substream->runtime);
@@ -585,9 +585,7 @@ static void cap_urb_complete(struct urb *urb)
 		/* Process any received bulk data */
 		if (urb->status == 0 && urb->actual_length > 0) {
 			unsigned char *buf = urb->transfer_buffer;
-			unsigned int bytes_processed = 0;
 			unsigned int frame_bytes = snd_pcm_format_size(runtime->format, runtime->channels);
-			int i = 0;
 			
 			/* New logic: accumulate trailing bytes between URBs so frames are not dropped. */
 			unsigned int bytes_available = urb->actual_length;
