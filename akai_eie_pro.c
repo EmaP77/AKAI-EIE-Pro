@@ -85,7 +85,10 @@ struct eie {
 	unsigned int cap_frames;
 	unsigned int cap_frame;          /* Current frame position in ALSA buffer */
 	unsigned int cap_period_pos;     /* Position within current period */
-
++	/* Spill buffer to hold trailing bytes between capture URBs (frames are 64 bytes) */
++	unsigned char cap_spill_buf[64];
++	unsigned int cap_spill_len;
+	
 	atomic_t frames_elapsed; /**< frames elapsed as reported by EIE */
 	spinlock_t lock;
 	unsigned long states;
@@ -374,28 +377,52 @@ static int fill_playback_urb(struct eie_playback_urb *epu)
 		epu->silent = true;
 	}
 
-	/* Setup ISO frame descriptors with strict packet size validation */
-	for (i = 0; i < PLAY_PKT_CNT; i++) {
-		int len = frames_wanted * (i+1) / PLAY_PKT_CNT - frames_filled;
-		unsigned int pkt_bytes = len * frame_bytes;
-		
-		/* Clamp packet size to prevent overflow of transfer buffer */
-		if (pkt_bytes > eie->play_packet_size) {
-			pkt_bytes = eie->play_packet_size;
-			len = pkt_bytes / frame_bytes;
+	/* Setup ISO frame descriptors ensuring packets are whole-frame multiples
+	 * and sum exactly to bytes_wanted when possible. This avoids partial-frame
+	 * packets that can cause timing and alignment glitches on large periods.
+	 */
+	{
+		unsigned int max_frames_per_pkt = eie->play_packet_size / frame_bytes;
+		unsigned int remaining_frames = frames_wanted;
+		unsigned int offset = 0;
+		int pkt_idx;
+
+		/* Sanity check: endpoint must be able to carry at least one frame */
+		if (max_frames_per_pkt == 0) {
+			dev_err(&eie->udev->dev, "Play endpoint packet too small for frame (%u bytes)", frame_bytes);
+			return -EINVAL;
 		}
-		
-		urb->iso_frame_desc[i].offset = frames_filled * frame_bytes;
-		urb->iso_frame_desc[i].length = pkt_bytes;
-		frames_filled += len;
-		
-		/* Safety check: ensure we don't exceed total requested frames */
-		if (frames_filled > frames_wanted)
-			frames_filled = frames_wanted;
+
+		for (pkt_idx = 0; pkt_idx < PLAY_PKT_CNT; pkt_idx++) {
+			unsigned int take_frames = (remaining_frames > max_frames_per_pkt) ? max_frames_per_pkt : remaining_frames;
+			unsigned int pkt_bytes = take_frames * frame_bytes;
+
+			urb->iso_frame_desc[pkt_idx].offset = offset;
+			urb->iso_frame_desc[pkt_idx].length = pkt_bytes;
+
+			offset += pkt_bytes;
+			remaining_frames -= take_frames;
+
+			/* When all frames are assigned, zero remaining packet lengths */
+			if (remaining_frames == 0) {
+				int j;
+				for (j = pkt_idx + 1; j < PLAY_PKT_CNT; j++)
+					urb->iso_frame_desc[j].offset = 0, urb->iso_frame_desc[j].length = 0;
+				break;
+			}
+		}
+
+		/* If we couldn't fit all frames into the available packets, it's an error */
+		if (remaining_frames > 0) {
+			dev_err(&eie->udev->dev, "Not enough isoc packets (%d) to carry %u frames (max %u per pkt)",
+				PLAY_PKT_CNT, frames_wanted, max_frames_per_pkt);
+			return -EINVAL;
+		}
 	}
 
 	return 0;
 }
+
 
 static bool check_period_elapsed(struct eie *eie)
 {
@@ -562,30 +589,110 @@ static void cap_urb_complete(struct urb *urb)
 			unsigned int frame_bytes = snd_pcm_format_size(runtime->format, runtime->channels);
 			int i = 0;
 			
-			/* Process complete 64-byte frames only; ignore any trailing incomplete frame */
-			while (bytes_processed + 64 <= urb->actual_length) {
-				unsigned char *frame_buf = buf + bytes_processed;
+			/* New logic: accumulate trailing bytes between URBs so frames are not dropped. */
+			unsigned int bytes_available = urb->actual_length;
+			unsigned int buf_idx = 0;
+			int frames_decoded = 0;
+			
+			/* If we have a spill from the previous URB, try to complete a frame */
+			if (eie->cap_spill_len > 0 && bytes_available > 0) {
+				unsigned int need = 64 - eie->cap_spill_len;
+				unsigned int take = (bytes_available < need) ? bytes_available : need;
+				memcpy(eie->cap_spill_buf + eie->cap_spill_len, buf, take);
+				eie->cap_spill_len += take;
+				buf_idx += take;
+				bytes_available -= take;
 				
-				/* 64-byte frame - decode with improved bit manipulation */
-				int ch1, ch2, ch3, ch4;
+				if (eie->cap_spill_len == 64) {
+					unsigned char *frame_buf = eie->cap_spill_buf;
+					/* decode frame_buf (exactly 64 bytes) */
+					int ch1 = 0, ch2 = 0, ch3 = 0, ch4 = 0;
+					int j;
+					for (j = 0; j < 24; j++) {
+						ch1 |= (frame_buf[j] & 1) << (23-j);
+						ch3 |= ((frame_buf[j] & 2) >> 1) << (23-j);
+					}
+					for (j = 32; j < 56; j++) {
+						ch2 |= (frame_buf[j] & 1) << (55-j);
+						ch4 |= ((frame_buf[j] & 2) >> 1) << (55-j);
+					}
+					if (ch1 & 0x800000) ch1 |= 0xFF000000;
+					if (ch2 & 0x800000) ch2 |= 0xFF000000;
+					if (ch3 & 0x800000) ch3 |= 0xFF000000;
+					if (ch4 & 0x800000) ch4 |= 0xFF000000;
+					
+					/* Write to ALSA buffer */
+					unsigned int format = runtime->format;
+					unsigned int channels = runtime->channels;
+					unsigned char *out = runtime->dma_area + eie->cap_frame * frame_bytes;
+					if (eie->cap_frame >= runtime->buffer_size) {
+						dev_warn(&eie->udev->dev, "Capture buffer overflow: frame %lu >= buffer size %lu",
+							(unsigned long)eie->cap_frame, (unsigned long)runtime->buffer_size);
+						eie->cap_frame = 0;
+						out = runtime->dma_area;
+					}
+					eie->cap_frame = (eie->cap_frame + 1) % runtime->buffer_size;
+					if (format == SNDRV_PCM_FORMAT_S32_LE) {
+						__le32 *out32 = (__le32 *)out;
+						if (channels == 4) {
+							out32[0] = cpu_to_le32(ch1 << 8);
+							out32[1] = cpu_to_le32(ch2 << 8);
+							out32[2] = cpu_to_le32(ch3 << 8);
+							out32[3] = cpu_to_le32(ch4 << 8);
+						} else if (channels == 2) {
+							out32[0] = cpu_to_le32(ch1 << 8);
+							out32[1] = cpu_to_le32(ch2 << 8);
+						} else if (channels == 1) {
+							int mixed = (ch1 + ch2) / 2;
+							out32[0] = cpu_to_le32(mixed << 8);
+						}
+					} else if (format == SNDRV_PCM_FORMAT_S24_LE) {
+						if (channels == 4) {
+							*((__le32 *)&out[0]) = cpu_to_le32(ch1 & 0x00ffffff);
+							*((__le32 *)&out[3]) = cpu_to_le32(ch2 & 0x00ffffff);
+							*((__le32 *)&out[6]) = cpu_to_le32(ch3 & 0x00ffffff);
+							*((__le32 *)&out[9]) = cpu_to_le32(ch4 & 0x00ffffff);
+						} else if (channels == 2) {
+							*((__le32 *)&out[0]) = cpu_to_le32(ch1 & 0x00ffffff);
+							*((__le32 *)&out[3]) = cpu_to_le32(ch2 & 0x00ffffff);
+						} else if (channels == 1) {
+							int mixed = (ch1 + ch2) / 2;
+							*((__le32 *)&out[0]) = cpu_to_le32(mixed & 0x00ffffff);
+						}
+					} else if (format == SNDRV_PCM_FORMAT_S16_LE) {
+						__le16 *out16 = (__le16 *)out;
+						if (channels == 4) {
+							out16[0] = cpu_to_le16(ch1 >> 8);
+							out16[1] = cpu_to_le16(ch2 >> 8);
+							out16[2] = cpu_to_le16(ch3 >> 8);
+							out16[3] = cpu_to_le16(ch4 >> 8);
+						} else if (channels == 2) {
+							out16[0] = cpu_to_le16(ch1 >> 8);
+							out16[1] = cpu_to_le16(ch2 >> 8);
+						} else if (channels == 1) {
+							int mixed = (ch1 + ch2) / 2;
+							out16[0] = cpu_to_le16(mixed >> 8);
+						}
+					}
+					frames_decoded++;
+					eie->cap_spill_len = 0; /* consumed spill */
+				}
+			}
+			
+			/* Process remaining full 64-byte frames from the URB */
+			while (bytes_available >= 64) {
+				unsigned char *frame_buf = buf + buf_idx;
+				int ch1 = 0, ch2 = 0, ch3 = 0, ch4 = 0;
 				int j;
-				
-				ch1 = ch2 = ch3 = ch4 = 0;
-				
-				/* First 24 bytes for channels 1 and 3 - improved bit extraction */
 				for (j = 0; j < 24; j++) {
-					ch1 |= (frame_buf[j] & 1) << (23-j);  /* MSB alignment for better volume */
+					ch1 |= (frame_buf[j] & 1) << (23-j);
 					ch3 |= ((frame_buf[j] & 2) >> 1) << (23-j);
 				}
-				
-				/* Bytes 32-55 for channels 2 and 4 - improved bit extraction */  
 				for (j = 32; j < 56; j++) {
 					ch2 |= (frame_buf[j] & 1) << (55-j);
 					ch4 |= ((frame_buf[j] & 2) >> 1) << (55-j);
 				}
-				
-				/* Sign extend from 24-bit to 32-bit for proper audio levels */
-				if (ch1 & 0x800000) ch1 |= 0xFF000000;  /* Sign extend */
+				if (ch1 & 0x800000) ch1 |= 0xFF000000;
 				if (ch2 & 0x800000) ch2 |= 0xFF000000;
 				if (ch3 & 0x800000) ch3 |= 0xFF000000;
 				if (ch4 & 0x800000) ch4 |= 0xFF000000;
@@ -593,38 +700,29 @@ static void cap_urb_complete(struct urb *urb)
 				unsigned int format = runtime->format;
 				unsigned int channels = runtime->channels;
 				unsigned char *out = runtime->dma_area + eie->cap_frame * frame_bytes;
-				
-				/* Check for buffer overflow */
 				if (eie->cap_frame >= runtime->buffer_size) {
 					dev_warn(&eie->udev->dev, "Capture buffer overflow: frame %lu >= buffer size %lu",
 						(unsigned long)eie->cap_frame, (unsigned long)runtime->buffer_size);
 					eie->cap_frame = 0;
 					out = runtime->dma_area;
 				}
-				
-				/* Advance buffer position */
 				eie->cap_frame = (eie->cap_frame + 1) % runtime->buffer_size;
-				
 				if (format == SNDRV_PCM_FORMAT_S32_LE) {
 					__le32 *out32 = (__le32 *)out;
 					if (channels == 4) {
-						/* Use proper 24-bit values shifted to 32-bit range for full volume */
-						out32[0] = cpu_to_le32(ch1 << 8);  /* Shift 24-bit to 32-bit MSB */
+						out32[0] = cpu_to_le32(ch1 << 8);
 						out32[1] = cpu_to_le32(ch2 << 8);
 						out32[2] = cpu_to_le32(ch3 << 8);
 						out32[3] = cpu_to_le32(ch4 << 8);
 					} else if (channels == 2) {
-						/* Use first two channels with proper level adjustment for stereo */
 						out32[0] = cpu_to_le32(ch1 << 8);
 						out32[1] = cpu_to_le32(ch2 << 8);
 					} else if (channels == 1) {
-						/* Mix first two channels for mono to avoid mono-only issue */
 						int mixed = (ch1 + ch2) / 2;
 						out32[0] = cpu_to_le32(mixed << 8);
 					}
 				} else if (format == SNDRV_PCM_FORMAT_S24_LE) {
 					if (channels == 4) {
-						/* For S24_LE, use the raw 24-bit values with better packing */
 						*((__le32 *)&out[0]) = cpu_to_le32(ch1 & 0x00ffffff);
 						*((__le32 *)&out[3]) = cpu_to_le32(ch2 & 0x00ffffff);
 						*((__le32 *)&out[6]) = cpu_to_le32(ch3 & 0x00ffffff);
@@ -639,41 +737,45 @@ static void cap_urb_complete(struct urb *urb)
 				} else if (format == SNDRV_PCM_FORMAT_S16_LE) {
 					__le16 *out16 = (__le16 *)out;
 					if (channels == 4) {
-						/* For S16_LE, use upper 16 bits with proper scaling */
-						out16[0] = cpu_to_le16(ch1 >> 8);  /* 24-bit to 16-bit conversion */
+						out16[0] = cpu_to_le16(ch1 >> 8);
 						out16[1] = cpu_to_le16(ch2 >> 8);
 						out16[2] = cpu_to_le16(ch3 >> 8);
 						out16[3] = cpu_to_le16(ch4 >> 8);
 					} else if (channels == 2) {
-						/* Ensure proper stereo: use different channels for L/R */
-						out16[0] = cpu_to_le16(ch1 >> 8);  /* Left channel */
-						out16[1] = cpu_to_le16(ch2 >> 8);  /* Right channel */
+						out16[0] = cpu_to_le16(ch1 >> 8);
+						out16[1] = cpu_to_le16(ch2 >> 8);
 					} else if (channels == 1) {
-						/* Mix first two channels for mono */
 						int mixed = (ch1 + ch2) / 2;
 						out16[0] = cpu_to_le16(mixed >> 8);
 					}
 				}
-				
-				bytes_processed += 64;
-				i++;
+				frames_decoded++;
+				buf_idx += 64;
+				bytes_available -= 64;
+			}
+			
+			/* Any remaining trailing bytes become the new spill */
+			if (bytes_available > 0) {
+				/* Copy remaining bytes to spill buffer for next URB */
+				if (bytes_available <= sizeof(eie->cap_spill_buf)) {
+					memcpy(eie->cap_spill_buf, buf + buf_idx, bytes_available);
+					eie->cap_spill_len = bytes_available;
+				} else {
+					/* Should not happen, but guard anyway */
+					memcpy(eie->cap_spill_buf, buf + buf_idx, sizeof(eie->cap_spill_buf));
+					eie->cap_spill_len = sizeof(eie->cap_spill_buf);
+				}
+			} else {
+				eie->cap_spill_len = 0;
 			}
 			
 			/* Update period tracking with actual frames decoded */
-			eie->cap_period_pos += i;
+			eie->cap_period_pos += frames_decoded;
 			if (eie->cap_period_pos >= runtime->period_size) {
 				eie->cap_period_pos = 0;
 				elapsed = true;
 			}
 			
-			/* Warn if there are unprocessed trailing bytes */
-			if (urb->actual_length % 64 != 0) {
-				static int truncate_count = 0;
-				if ((truncate_count++ % 100) == 0) {
-					dev_dbg(&eie->udev->dev, "Capture: %u trailing bytes ignored (truncated)",
-						urb->actual_length % 64);
-				}
-			}
 		}
 	}
 
@@ -1350,6 +1452,9 @@ static int eie_probe(struct usb_interface *interface, const struct usb_device_id
 
 	spin_lock_init(&eie->lock);
 	init_waitqueue_head(&eie->urbs_flow_wait);
++	/* Initialize capture spill buffer state */
++	eie->cap_spill_len = 0;
++	memset(eie->cap_spill_buf, 0, sizeof(eie->cap_spill_buf));
 
 	eie->ifa = interface;
 	eie->ifb = usb_ifnum_to_if(eie->udev, 1);
