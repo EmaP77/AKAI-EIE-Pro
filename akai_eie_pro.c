@@ -374,12 +374,24 @@ static int fill_playback_urb(struct eie_playback_urb *epu)
 		epu->silent = true;
 	}
 
-	/* Setup ISO frame descriptors */
+	/* Setup ISO frame descriptors with strict packet size validation */
 	for (i = 0; i < PLAY_PKT_CNT; i++) {
 		int len = frames_wanted * (i+1) / PLAY_PKT_CNT - frames_filled;
+		unsigned int pkt_bytes = len * frame_bytes;
+		
+		/* Clamp packet size to prevent overflow of transfer buffer */
+		if (pkt_bytes > eie->play_packet_size) {
+			pkt_bytes = eie->play_packet_size;
+			len = pkt_bytes / frame_bytes;
+		}
+		
 		urb->iso_frame_desc[i].offset = frames_filled * frame_bytes;
-		urb->iso_frame_desc[i].length = len * frame_bytes;
+		urb->iso_frame_desc[i].length = pkt_bytes;
 		frames_filled += len;
+		
+		/* Safety check: ensure we don't exceed total requested frames */
+		if (frames_filled > frames_wanted)
+			frames_filled = frames_wanted;
 	}
 
 	return 0;
@@ -546,18 +558,13 @@ static void cap_urb_complete(struct urb *urb)
 		/* Process any received bulk data */
 		if (urb->status == 0 && urb->actual_length > 0) {
 			unsigned char *buf = urb->transfer_buffer;
-			unsigned int frames_received = urb->actual_length / 64;
-			int i;
+			unsigned int bytes_processed = 0;
+			unsigned int frame_bytes = snd_pcm_format_size(runtime->format, runtime->channels);
+			int i = 0;
 			
-			/* Log data size and sample content for debugging - very infrequently */
-			static int data_log_counter = 0;
-			if (data_log_counter++ % 50000 == 0) {  /* Much less frequent logging */
-				dev_info(&eie->udev->dev, "Capture processing: %d bytes, %d frames", 
-					 urb->actual_length, frames_received);
-			}
-			
-			for (i = 0; i < frames_received; i++) {
-				unsigned char *frame_buf = buf + (i * 64);
+			/* Process complete 64-byte frames only; ignore any trailing incomplete frame */
+			while (bytes_processed + 64 <= urb->actual_length) {
+				unsigned char *frame_buf = buf + bytes_processed;
 				
 				/* 64-byte frame - decode with improved bit manipulation */
 				int ch1, ch2, ch3, ch4;
@@ -585,8 +592,15 @@ static void cap_urb_complete(struct urb *urb)
 				
 				unsigned int format = runtime->format;
 				unsigned int channels = runtime->channels;
-				unsigned int frame_bytes = snd_pcm_format_size(format, channels);
 				unsigned char *out = runtime->dma_area + eie->cap_frame * frame_bytes;
+				
+				/* Check for buffer overflow */
+				if (eie->cap_frame >= runtime->buffer_size) {
+					dev_warn(&eie->udev->dev, "Capture buffer overflow: frame %lu >= buffer size %lu",
+						(unsigned long)eie->cap_frame, (unsigned long)runtime->buffer_size);
+					eie->cap_frame = 0;
+					out = runtime->dma_area;
+				}
 				
 				/* Advance buffer position */
 				eie->cap_frame = (eie->cap_frame + 1) % runtime->buffer_size;
@@ -641,19 +655,24 @@ static void cap_urb_complete(struct urb *urb)
 					}
 				}
 				
-				/* Debug: Log decoded values very infrequently to avoid spam */
-				static int decode_log_counter = 0;
-				if (i == 0 && (decode_log_counter++ % 100000 == 0)) {  /* Very infrequent logging */
-					dev_info(&eie->udev->dev, "Audio processing active: Format=%d, Channels=%d", 
-						format, channels);
-				}
+				bytes_processed += 64;
+				i++;
 			}
 			
-			/* Update period tracking */
-			eie->cap_period_pos += frames_received;
+			/* Update period tracking with actual frames decoded */
+			eie->cap_period_pos += i;
 			if (eie->cap_period_pos >= runtime->period_size) {
 				eie->cap_period_pos = 0;
 				elapsed = true;
+			}
+			
+			/* Warn if there are unprocessed trailing bytes */
+			if (urb->actual_length % 64 != 0) {
+				static int truncate_count = 0;
+				if ((truncate_count++ % 100) == 0) {
+					dev_dbg(&eie->udev->dev, "Capture: %u trailing bytes ignored (truncated)",
+						urb->actual_length % 64);
+				}
 			}
 		}
 	}
