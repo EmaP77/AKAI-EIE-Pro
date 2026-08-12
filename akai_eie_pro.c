@@ -36,7 +36,7 @@ static struct usb_driver eie_driver;
 #define PLAY_PKT_CNT 40
 #define CAP_URB_CNT 2
 
-#define BYTES_PER_FRAME 12
+#define BYTES_PER_FRAME 12 /* Default 4ch 24-bit frame; avoid using as a fixed runtime assumption */
 
 enum {
 	PLAYBACK_RUNNING,
@@ -112,8 +112,8 @@ static struct snd_pcm_hardware eie_playback_hw = {
 	.channels_min = 4,
 	.channels_max = 4,
 	.buffer_bytes_max = 1024 * 1024,  /* 1MB buffer */
-	.period_bytes_min = 64*BYTES_PER_FRAME,
-	.period_bytes_max = 8192*BYTES_PER_FRAME,  /* Limit max period size */
+	.period_bytes_min = 64,  /* format-independent minimum */
+	.period_bytes_max = 8192 * 16,  /* allow 4ch S16/S24/S32 periods without forcing a fixed byte width */
 	.periods_min = 4,  /* More periods for smoother playback */
 	.periods_max = 64,
 };
