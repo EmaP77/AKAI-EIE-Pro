@@ -498,10 +498,10 @@ static void cap_urb_complete(struct urb *urb)
 	if (urb->status) {
 		if (urb->status == -ENOENT || /* unlinked */
 		    urb->status == -ECONNRESET || /* unlinked */
-		    urb->status == -ESHUTDOWN) /* device disabled */
-			return;
+			urb->status == -ESHUTDOWN) /* device disabled */
+				return;
 
-		dev_dbg(&eie->udev->dev, "cap urb status: %d", urb->status);
+			dev_dbg(&eie->udev->dev, "cap urb status: %d", urb->status);
 	}
 
 	spin_lock_irqsave(&eie->lock, flags);
@@ -523,7 +523,7 @@ static void cap_urb_complete(struct urb *urb)
 			}
 			
 			for (i = 0; i < frames_received; i++) {
-				unsigned char *frame_buf = buf + (i * 64);
+				unsigned char *frame_buf = buf + ((size_t)i * 64);
 				
 				/* 64-byte frame - decode with improved bit manipulation */
 				int ch1, ch2, ch3, ch4;
@@ -548,7 +548,6 @@ static void cap_urb_complete(struct urb *urb)
 				if (ch2 & 0x800000) ch2 |= 0xFF000000;
 				if (ch3 & 0x800000) ch3 |= 0xFF000000;
 				if (ch4 & 0x800000) ch4 |= 0xFF000000;
-				
 				unsigned int format = runtime->format;
 				unsigned int channels = runtime->channels;
 				unsigned int frame_bytes = snd_pcm_format_size(format, channels);
