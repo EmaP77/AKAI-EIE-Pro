@@ -85,9 +85,9 @@ struct eie {
 	unsigned int cap_frames;
 	unsigned int cap_frame;          /* Current frame position in ALSA buffer */
 	unsigned int cap_period_pos;     /* Position within current period */
-+	/* Spill buffer to hold trailing bytes between capture URBs (frames are 64 bytes) */
-+	unsigned char cap_spill_buf[64];
-+	unsigned int cap_spill_len;
+	/* Spill buffer to hold trailing bytes between capture URBs (frames are 64 bytes) */
+	unsigned char cap_spill_buf[64];
+	unsigned int cap_spill_len;
 	
 	atomic_t frames_elapsed; /**< frames elapsed as reported by EIE */
 	spinlock_t lock;
@@ -1452,9 +1452,9 @@ static int eie_probe(struct usb_interface *interface, const struct usb_device_id
 
 	spin_lock_init(&eie->lock);
 	init_waitqueue_head(&eie->urbs_flow_wait);
-+	/* Initialize capture spill buffer state */
-+	eie->cap_spill_len = 0;
-+	memset(eie->cap_spill_buf, 0, sizeof(eie->cap_spill_buf));
+	/* Initialize capture spill buffer state */
+	eie->cap_spill_len = 0;
+	memset(eie->cap_spill_buf, 0, sizeof(eie->cap_spill_buf));
 
 	eie->ifa = interface;
 	eie->ifb = usb_ifnum_to_if(eie->udev, 1);
