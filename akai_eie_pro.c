@@ -24,7 +24,7 @@ MODULE_LICENSE("GPL v2");
 MODULE_VERSION("1.0");
 
 static const int index[SNDRV_CARDS] = SNDRV_DEFAULT_IDX;
-static char * const id[SNDRV_CARDS] = SNDRV_DEFAULT_STR;
+static const char * const id[SNDRV_CARDS] = SNDRV_DEFAULT_STR;
 static const bool enable[SNDRV_CARDS] = SNDRV_DEFAULT_ENABLE_PNP;
 
 static DEFINE_MUTEX(devices_mutex);
