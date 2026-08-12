@@ -307,6 +307,14 @@ static unsigned int calc_frames_wanted(struct eie *eie)
 	}
 }
 
+static unsigned int eie_frame_bytes(struct snd_pcm_runtime *runtime)
+{
+	if (!runtime)
+		return BYTES_PER_FRAME;
+
+	return snd_pcm_format_size(runtime->format, runtime->channels);
+}
+
 static int fill_playback_urb(struct eie_playback_urb *epu)
 {
 	struct snd_pcm_runtime *runtime;
@@ -315,9 +323,13 @@ static int fill_playback_urb(struct eie_playback_urb *epu)
 	unsigned int frames_wanted = calc_frames_wanted(eie);
 	unsigned int frames_elapsed = atomic_xchg(&eie->frames_elapsed, 0);
 	unsigned int frames_filled = 0;
+	unsigned int frame_bytes = BYTES_PER_FRAME;
 	unsigned int bytes_wanted;
 	unsigned char *start;
 	int i;
+
+	if (eie->play_substream && eie->play_substream->runtime)
+		frame_bytes = eie_frame_bytes(eie->play_substream->runtime);
 
 	/* Use hardware feedback if reasonable - stable tolerance */
 	if ((frames_elapsed > frames_wanted - 1)
@@ -325,7 +337,7 @@ static int fill_playback_urb(struct eie_playback_urb *epu)
 		&& frames_elapsed > 0) {
 		frames_wanted = frames_elapsed;
 	}
-	bytes_wanted = BYTES_PER_FRAME * frames_wanted;
+	bytes_wanted = frame_bytes * frames_wanted;
 
 	if (bytes_wanted > urb->transfer_buffer_length)
 		return -EINVAL;
@@ -337,12 +349,12 @@ static int fill_playback_urb(struct eie_playback_urb *epu)
 			return -EINVAL;
 
 		/* Copy from ALSA's buffer to URB */
-		start = runtime->dma_area + eie->play_buf_pos * BYTES_PER_FRAME;
+		start = runtime->dma_area + eie->play_buf_pos * frame_bytes;
 		if (eie->play_buf_pos + frames_wanted <= runtime->buffer_size) {
 			memcpy(urb->transfer_buffer, start, bytes_wanted);
 			eie->play_buf_pos += frames_wanted;
 		} else {
-			unsigned int part_bytes = BYTES_PER_FRAME *
+			unsigned int part_bytes = frame_bytes *
 				(runtime->buffer_size - eie->play_buf_pos);
 			memcpy(urb->transfer_buffer, start, part_bytes);
 			memcpy(urb->transfer_buffer + part_bytes,
@@ -365,8 +377,8 @@ static int fill_playback_urb(struct eie_playback_urb *epu)
 	/* Setup ISO frame descriptors */
 	for (i = 0; i < PLAY_PKT_CNT; i++) {
 		int len = frames_wanted * (i+1) / PLAY_PKT_CNT - frames_filled;
-		urb->iso_frame_desc[i].offset = frames_filled * BYTES_PER_FRAME;
-		urb->iso_frame_desc[i].length = len * BYTES_PER_FRAME;
+		urb->iso_frame_desc[i].offset = frames_filled * frame_bytes;
+		urb->iso_frame_desc[i].length = len * frame_bytes;
 		frames_filled += len;
 	}
 
@@ -420,6 +432,26 @@ static void abort_capture(struct eie *eie)
 	}
 }
 
+static int eie_wait_for_urbs_flow(struct eie *eie, unsigned int timeout_ms)
+{
+	long ret;
+
+	if (test_bit(DISCONNECTED, &eie->states))
+		return -ENODEV;
+
+	ret = wait_event_timeout(eie->urbs_flow_wait,
+		test_bit(URBS_FLOWING, &eie->states) ||
+		test_bit(DISCONNECTED, &eie->states),
+		msecs_to_jiffies(timeout_ms));
+	if (ret <= 0) {
+		if (test_bit(DISCONNECTED, &eie->states))
+			return -ENODEV;
+		return -ETIMEDOUT;
+	}
+
+	return 0;
+}
+
 static void play_urb_complete(struct urb *urb)
 {
 	struct eie_playback_urb *epu = urb->context;
@@ -469,8 +501,10 @@ err:
 	/* Period elapsed notification - SAFE: called outside spinlock */
 	if (elapsed)
 		snd_pcm_period_elapsed(eie->play_substream);
-	if (abort)
+	if (abort) {
+		kill_all_urbs(eie);
 		abort_playback(eie);
+	}
 }
 
 static void cap_urb_complete(struct urb *urb)
@@ -652,8 +686,10 @@ static void cap_urb_complete(struct urb *urb)
 	/* Period elapsed notification */
 	if (elapsed)
 		snd_pcm_period_elapsed(eie->cap_substream);
-	if (abort)
+	if (abort) {
+		kill_all_urbs(eie);
 		abort_capture(eie);
+	}
 }
 
 static void sync_urb_complete(struct urb *urb)
@@ -838,7 +874,9 @@ static int eie_ppcm_trigger(struct snd_pcm_substream *substream, int cmd)
 			err = submit_init_play_urbs(eie);
 			if (err < 0)
 				return err;
-			wait_event(eie->urbs_flow_wait, test_bit(URBS_FLOWING, &eie->states));
+			err = eie_wait_for_urbs_flow(eie, 100);
+			if (err < 0)
+				return err;
 			
 			/* Small delay to let hardware stabilize and avoid initial plucks */
 			usleep_range(1000, 2000);  /* 1-2ms stabilization delay */
@@ -891,7 +929,11 @@ static int eie_cpcm_trigger(struct snd_pcm_substream *substream, int cmd)
 				dev_err(&eie->udev->dev, "Failed to start playbook URBs for capture: %d", err);
 				return err;
 			}
-			wait_event(eie->urbs_flow_wait, test_bit(URBS_FLOWING, &eie->states));
+			err = eie_wait_for_urbs_flow(eie, 100);
+			if (err < 0) {
+				dev_err(&eie->udev->dev, "Timed out waiting for playback URBs during capture start: %d", err);
+				return err;
+			}
 		}
 		
 		set_bit(CAPTURE_RUNNING, &eie->states);
