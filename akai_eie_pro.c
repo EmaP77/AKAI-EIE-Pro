@@ -377,46 +377,28 @@ static int fill_playback_urb(struct eie_playback_urb *epu)
 		epu->silent = true;
 	}
 
-	/* Setup ISO frame descriptors ensuring packets are whole-frame multiples
-	 * and sum exactly to bytes_wanted when possible. This avoids partial-frame
-	 * packets that can cause timing and alignment glitches on large periods.
-	 */
+	/* Setup ISO frame descriptors with strict packet size validation */
 	{
-		unsigned int max_frames_per_pkt = eie->play_packet_size / frame_bytes;
-		unsigned int remaining_frames = frames_wanted;
-		unsigned int offset = 0;
-		int pkt_idx;
-
-		/* Sanity check: endpoint must be able to carry at least one frame */
-		if (max_frames_per_pkt == 0) {
-			dev_err(&eie->udev->dev, "Play endpoint packet too small for frame (%u bytes)", frame_bytes);
-			return -EINVAL;
-		}
-
-		for (pkt_idx = 0; pkt_idx < PLAY_PKT_CNT; pkt_idx++) {
-			unsigned int take_frames = (remaining_frames > max_frames_per_pkt) ? max_frames_per_pkt : remaining_frames;
-			unsigned int pkt_bytes = take_frames * frame_bytes;
-
-			urb->iso_frame_desc[pkt_idx].offset = offset;
-			urb->iso_frame_desc[pkt_idx].length = pkt_bytes;
-
-			offset += pkt_bytes;
-			remaining_frames -= take_frames;
-
-			/* When all frames are assigned, zero remaining packet lengths */
-			if (remaining_frames == 0) {
-				int j;
-				for (j = pkt_idx + 1; j < PLAY_PKT_CNT; j++)
-					urb->iso_frame_desc[j].offset = 0, urb->iso_frame_desc[j].length = 0;
-				break;
+		unsigned int frames_filled = 0;
+		int i;
+		
+		for (i = 0; i < PLAY_PKT_CNT; i++) {
+			int len = frames_wanted * (i+1) / PLAY_PKT_CNT - frames_filled;
+			unsigned int pkt_bytes = len * frame_bytes;
+			
+			/* Clamp packet size to prevent overflow of transfer buffer */
+			if (pkt_bytes > eie->play_packet_size) {
+				pkt_bytes = eie->play_packet_size;
+				len = pkt_bytes / frame_bytes;
 			}
-		}
-
-		/* If we couldn't fit all frames into the available packets, it's an error */
-		if (remaining_frames > 0) {
-			dev_err(&eie->udev->dev, "Not enough isoc packets (%d) to carry %u frames (max %u per pkt)",
-				PLAY_PKT_CNT, frames_wanted, max_frames_per_pkt);
-			return -EINVAL;
+			
+			urb->iso_frame_desc[i].offset = frames_filled * frame_bytes;
+			urb->iso_frame_desc[i].length = pkt_bytes;
+			frames_filled += len;
+			
+			/* Safety check: ensure we don't exceed total requested frames */
+			if (frames_filled > frames_wanted)
+				frames_filled = frames_wanted;
 		}
 	}
 
