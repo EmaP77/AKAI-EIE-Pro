@@ -23,9 +23,9 @@ MODULE_AUTHOR("Enhanced by Jakob, based on Michal Rydlo <michal.rydlo@gmail.com>
 MODULE_LICENSE("GPL v2");
 MODULE_VERSION("1.0");
 
-static int index[SNDRV_CARDS] = SNDRV_DEFAULT_IDX;
-static char *id[SNDRV_CARDS] = SNDRV_DEFAULT_STR;
-static bool enable[SNDRV_CARDS] = SNDRV_DEFAULT_ENABLE_PNP;
+static const int index[SNDRV_CARDS] = SNDRV_DEFAULT_IDX;
+static char * const id[SNDRV_CARDS] = SNDRV_DEFAULT_STR;
+static const bool enable[SNDRV_CARDS] = SNDRV_DEFAULT_ENABLE_PNP;
 
 static DEFINE_MUTEX(devices_mutex);
 static unsigned int devices_used;
@@ -94,7 +94,7 @@ struct eie {
 /* Forward declarations */
 static int reset_eie(struct eie *eie, unsigned int rate);
 
-static struct snd_pcm_hardware eie_playback_hw = {
+static const struct snd_pcm_hardware eie_playback_hw = {
 	.info = (SNDRV_PCM_INFO_MMAP |
 		SNDRV_PCM_INFO_MMAP_VALID |
 		SNDRV_PCM_INFO_BATCH |
@@ -118,7 +118,7 @@ static struct snd_pcm_hardware eie_playback_hw = {
 	.periods_max = 64,
 };
 
-static struct snd_pcm_hardware eie_capture_hw = {
+static const struct snd_pcm_hardware eie_capture_hw = {
 	.info = (SNDRV_PCM_INFO_MMAP |
 		SNDRV_PCM_INFO_MMAP_VALID |
 		SNDRV_PCM_INFO_BATCH |
@@ -141,8 +141,6 @@ static struct snd_pcm_hardware eie_capture_hw = {
 	.periods_min = 2,  /* Reduce minimum periods for lower latency */
 	.periods_max = 128,  /* More periods for stability */
 };
-
-
 
 /* Forward declarations */
 static void kill_all_urbs(struct eie *eie);
@@ -249,7 +247,7 @@ struct magic_seq {
 	__u16 size;
 };
 
-static struct magic_seq magic_seq1[] = {
+static const struct magic_seq magic_seq1[] = {
 	{0xc0, 86, 0, 0, 3},
 	{0xc0, 86, 0, 0, 5},
 	{0xc0, 73, 0, 0, 1},
@@ -257,7 +255,7 @@ static struct magic_seq magic_seq1[] = {
 	{0, 0, 0, 0, 0}
 };
 
-static struct magic_seq magic_seq2[] = {
+static const struct magic_seq magic_seq2[] = {
 	{0x22, 1, 0x0100, 134, 3},
 	{0x22, 1, 0x0100, 2, 3},
 	{0x22, 1, 0x0100, 134, 3},
@@ -269,7 +267,7 @@ static struct magic_seq magic_seq2[] = {
 
 #define MAX_MAGIC_SEQ_LENGTH 5
 
-static int send_magic_sequence(struct eie *eie, struct magic_seq *m, char *data)
+static int send_magic_sequence(struct eie *eie, const struct magic_seq *m, char *data)
 {
 	int err;
 
@@ -1381,13 +1379,13 @@ static void eie_disconnect(struct usb_interface *interface)
 	mutex_unlock(&devices_mutex);
 }
 
-static struct usb_device_id eie_ids[] = {
+static const struct usb_device_id eie_ids[] = {
 	{ USB_DEVICE(0x09e8, 0x0010) }, /* EIE pro */
 	{ }
 };
 MODULE_DEVICE_TABLE(usb, eie_ids);
 
-static struct usb_driver eie_driver = {
+static const struct usb_driver eie_driver = {
 	.name = "snd-eie",
 	.id_table = eie_ids,
 	.probe = eie_probe,
