@@ -23,12 +23,13 @@ MODULE_AUTHOR("Enhanced by Jakob, based on Michal Rydlo <michal.rydlo@gmail.com>
 MODULE_LICENSE("GPL v2");
 MODULE_VERSION("1.0");
 
-static const int index[SNDRV_CARDS] = SNDRV_DEFAULT_IDX;
-static const char * const id[SNDRV_CARDS] = SNDRV_DEFAULT_STR;
-static const bool enable[SNDRV_CARDS] = SNDRV_DEFAULT_ENABLE_PNP;
+static int index[SNDRV_CARDS] = SNDRV_DEFAULT_IDX;
+static char *id[SNDRV_CARDS] = SNDRV_DEFAULT_STR;
+static bool enable[SNDRV_CARDS] = SNDRV_DEFAULT_ENABLE_PNP;
 
 static DEFINE_MUTEX(devices_mutex);
-static const struct usb_driver eie_driver;
+static unsigned int devices_used;
+static struct usb_driver eie_driver;
 
 #define SYNC_URB_CNT 2
 #define PLAY_URB_CNT 4
@@ -93,7 +94,7 @@ struct eie {
 /* Forward declarations */
 static int reset_eie(struct eie *eie, unsigned int rate);
 
-static const struct snd_pcm_hardware eie_playback_hw = {
+static struct snd_pcm_hardware eie_playback_hw = {
 	.info = (SNDRV_PCM_INFO_MMAP |
 		SNDRV_PCM_INFO_MMAP_VALID |
 		SNDRV_PCM_INFO_BATCH |
@@ -117,7 +118,7 @@ static const struct snd_pcm_hardware eie_playback_hw = {
 	.periods_max = 64,
 };
 
-static const struct snd_pcm_hardware eie_capture_hw = {
+static struct snd_pcm_hardware eie_capture_hw = {
 	.info = (SNDRV_PCM_INFO_MMAP |
 		SNDRV_PCM_INFO_MMAP_VALID |
 		SNDRV_PCM_INFO_BATCH |
@@ -140,6 +141,8 @@ static const struct snd_pcm_hardware eie_capture_hw = {
 	.periods_min = 2,  /* Reduce minimum periods for lower latency */
 	.periods_max = 128,  /* More periods for stability */
 };
+
+
 
 /* Forward declarations */
 static void kill_all_urbs(struct eie *eie);
@@ -246,7 +249,7 @@ struct magic_seq {
 	__u16 size;
 };
 
-static const struct magic_seq magic_seq1[] = {
+static struct magic_seq magic_seq1[] = {
 	{0xc0, 86, 0, 0, 3},
 	{0xc0, 86, 0, 0, 5},
 	{0xc0, 73, 0, 0, 1},
@@ -254,7 +257,7 @@ static const struct magic_seq magic_seq1[] = {
 	{0, 0, 0, 0, 0}
 };
 
-static const struct magic_seq magic_seq2[] = {
+static struct magic_seq magic_seq2[] = {
 	{0x22, 1, 0x0100, 134, 3},
 	{0x22, 1, 0x0100, 2, 3},
 	{0x22, 1, 0x0100, 134, 3},
@@ -266,7 +269,7 @@ static const struct magic_seq magic_seq2[] = {
 
 #define MAX_MAGIC_SEQ_LENGTH 5
 
-static int send_magic_sequence(struct eie *eie, const struct magic_seq *m, char *data)
+static int send_magic_sequence(struct eie *eie, struct magic_seq *m, char *data)
 {
 	int err;
 
@@ -495,6 +498,14 @@ static void cap_urb_complete(struct urb *urb)
 	if (urb->status) {
 		if (urb->status == -ENOENT || /* unlinked */
 		    urb->status == -ECONNRESET || /* unlinked */
+		    urb->status == -ESHUTDOWN) /* device disabled */
+			return;
+
+		dev_dbg(&eie->udev->dev, "cap urb status: %d", urb->status);
+	}
+
+	spin_lock_irqsave(&eie->lock, flags);
+
 	if (test_bit(CAPTURE_RUNNING, &eie->states) && substream) {
 		struct snd_pcm_runtime *runtime = substream->runtime;
 		
@@ -512,7 +523,7 @@ static void cap_urb_complete(struct urb *urb)
 			}
 			
 			for (i = 0; i < frames_received; i++) {
-				unsigned char *frame_buf = buf + ((size_t)i * 64);
+				unsigned char *frame_buf = buf + (i * 64);
 				
 				/* 64-byte frame - decode with improved bit manipulation */
 				int ch1, ch2, ch3, ch4;
@@ -537,6 +548,7 @@ static void cap_urb_complete(struct urb *urb)
 				if (ch2 & 0x800000) ch2 |= 0xFF000000;
 				if (ch3 & 0x800000) ch3 |= 0xFF000000;
 				if (ch4 & 0x800000) ch4 |= 0xFF000000;
+				
 				unsigned int format = runtime->format;
 				unsigned int channels = runtime->channels;
 				unsigned int frame_bytes = snd_pcm_format_size(format, channels);
@@ -1369,13 +1381,13 @@ static void eie_disconnect(struct usb_interface *interface)
 	mutex_unlock(&devices_mutex);
 }
 
-static const struct usb_device_id eie_ids[] = {
+static struct usb_device_id eie_ids[] = {
 	{ USB_DEVICE(0x09e8, 0x0010) }, /* EIE pro */
 	{ }
 };
 MODULE_DEVICE_TABLE(usb, eie_ids);
 
-static const struct usb_driver eie_driver = {
+static struct usb_driver eie_driver = {
 	.name = "snd-eie",
 	.id_table = eie_ids,
 	.probe = eie_probe,
