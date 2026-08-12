@@ -28,8 +28,7 @@ static const char * const id[SNDRV_CARDS] = SNDRV_DEFAULT_STR;
 static const bool enable[SNDRV_CARDS] = SNDRV_DEFAULT_ENABLE_PNP;
 
 static DEFINE_MUTEX(devices_mutex);
-static unsigned int devices_used;
-static struct usb_driver eie_driver;
+static const struct usb_driver eie_driver;
 
 #define SYNC_URB_CNT 2
 #define PLAY_URB_CNT 4
