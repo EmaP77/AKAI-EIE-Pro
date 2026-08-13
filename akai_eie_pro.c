@@ -535,25 +535,6 @@ static void abort_capture(struct eie *eie)
 	}
 }
 
-static int eie_wait_for_urbs_flow(struct eie *eie, unsigned int timeout_ms)
-{
-	long ret;
-
-	if (test_bit(DISCONNECTED, &eie->states))
-		return -ENODEV;
-
-	ret = wait_event_timeout(eie->urbs_flow_wait,
-		test_bit(URBS_FLOWING, &eie->states) ||
-		test_bit(DISCONNECTED, &eie->states),
-		msecs_to_jiffies(timeout_ms));
-	if (ret <= 0) {
-		if (test_bit(DISCONNECTED, &eie->states))
-			return -ENODEV;
-		return -ETIMEDOUT;
-	}
-
-	return 0;
-}
 
 static void play_urb_complete(struct urb *urb)
 {
@@ -1096,6 +1077,7 @@ static int eie_ppcm_trigger(struct snd_pcm_substream *substream, int cmd)
 		set_bit(PLAYBACK_RUNNING, &eie->states);
 		/* State checks are now atomic inside submit_init_play_urbs().
 		 * Returns -EBUSY if URBs already submitted, which is OK (not an error).
+		 * Trigger must be non-blocking: never wait after submission.
 		 */
 		if (eie->sync_endpoint_addr) {
 			err = submit_init_sync_urbs(eie);
@@ -1105,16 +1087,6 @@ static int eie_ppcm_trigger(struct snd_pcm_substream *substream, int cmd)
 		err = submit_init_play_urbs(eie);
 		if (err < 0 && err != -EBUSY)
 			return err;
-		/* Avoid sleeping in atomic context — caller may be in a locked syscall path
-		 * which triggers BUG: scheduling while atomic. Only wait if safe.
-		 */
-		if (!in_atomic()) {
-			err = eie_wait_for_urbs_flow(eie, 100);
-			if (err < 0)
-				return err;
-		} else {
-			dev_warn(&eie->udev->dev, "Trigger: skipping wait for URBs due to atomic context");
-		}
 		return 0;
 	case SNDRV_PCM_TRIGGER_STOP:
 		clear_bit(PLAYBACK_RUNNING, &eie->states);
@@ -1162,16 +1134,7 @@ static int eie_cpcm_trigger(struct snd_pcm_substream *substream, int cmd)
 			dev_err(&eie->udev->dev, "Failed to start playback URBs for capture: %d", err);
 			return err;
 		}
-		/* Avoid sleeping in atomic context — only wait when safe */
-		if (!in_atomic()) {
-			err = eie_wait_for_urbs_flow(eie, 100);
-			if (err < 0) {
-				dev_err(&eie->udev->dev, "Timed out waiting for playback URBs during capture start: %d", err);
-				return err;
-			}
-		} else {
-			dev_warn(&eie->udev->dev, "Capture trigger: skipping wait for URBs due to atomic context");
-		}
+		/* Trigger must be non-blocking: never wait after submission */
 		
 		set_bit(CAPTURE_RUNNING, &eie->states);
 		err = submit_init_cap_urbs(eie);
