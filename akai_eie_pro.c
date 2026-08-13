@@ -171,17 +171,10 @@ static int eie_set_alt_setting(struct eie *eie)
 
 static int eie_prepare_hw(struct snd_pcm_substream *substream)
 {
-	struct eie *eie = substream->private_data;
-	int err;
-
-	/* Ensure device is properly initialized */
-	err = reset_eie(eie, 48000); /* Default to 48kHz */
-	if (err < 0) {
-		dev_err(&eie->udev->dev, "Failed to initialize device: %d", err);
-		return err;
-	}
-
-	/* Set appropriate hardware constraints based on stream direction */
+	/* Set appropriate hardware constraints based on stream direction.
+	 * Do NOT call reset_eie here — that kills URBs and disrupts device state.
+	 * Rate changes are handled in eie_ppcm_prepare/eie_cpcm_prepare.
+	 */
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
 		substream->runtime->hw = eie_playback_hw;
 	} else {
@@ -1635,6 +1628,16 @@ static int eie_probe(struct usb_interface *interface, const struct usb_device_id
 	err = snd_card_register(card);
 	if (err < 0)
 		goto probe_err;
+
+	/* Initialize device at default 48kHz at probe time.
+	 * This sends the required magic sequence once. Rate changes are handled
+	 * in prepare() when the user selects a different rate.
+	 */
+	err = reset_eie(eie, 48000);
+	if (err < 0) {
+		dev_err(&eie->udev->dev, "Failed to initialize device at probe: %d", err);
+		goto probe_err;
+	}
 
 	init_urbs(eie);
 
