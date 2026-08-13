@@ -196,6 +196,16 @@ static int eie_ppcm_open(struct snd_pcm_substream *substream)
 {
 	struct eie *eie = substream->private_data;
 	int err;
+	
+	/* Defensive: Force-clear all state bits on open.
+	 * This handles cases where close() didn't run due to app crash or ALSA error.
+	 * Even if another stream is technically "open", we reset to allow recovery.
+	 */
+	clear_bit(PLAYBACK_RUNNING, &eie->states);
+	if (!eie->cap_substream) {
+		clear_bit(URBS_SUBMITTED, &eie->states);
+		clear_bit(URBS_FLOWING, &eie->states);
+	}
 
 	err = eie_prepare_hw(substream);
 	if (err < 0)
@@ -212,6 +222,15 @@ static int eie_cpcm_open(struct snd_pcm_substream *substream)
 	struct eie *eie = substream->private_data;
 	int err;
 
+	/* Defensive: Force-clear all state bits on open.
+	 * This handles cases where close() didn't run due to app crash or ALSA error.
+	 */
+	clear_bit(CAPTURE_RUNNING, &eie->states);
+	if (!eie->play_substream) {
+		clear_bit(URBS_SUBMITTED, &eie->states);
+		clear_bit(URBS_FLOWING, &eie->states);
+	}
+
 	err = eie_prepare_hw(substream);
 	if (err < 0)
 		return err;
@@ -225,14 +244,32 @@ static int eie_cpcm_open(struct snd_pcm_substream *substream)
 static int eie_ppcm_close(struct snd_pcm_substream *substream)
 {
 	struct eie *eie = substream->private_data;
+	/* Ensure playback state is fully cleared when stream closes.
+	 * This prevents state bits from persisting to the next stream open.
+	 */
+	clear_bit(PLAYBACK_RUNNING, &eie->states);
 	eie->play_substream = NULL;
+	
+	/* If both playback and capture are now closed, clear all URB state bits */
+	if (!eie->cap_substream) {
+		clear_bit(URBS_SUBMITTED, &eie->states);
+		clear_bit(URBS_FLOWING, &eie->states);
+	}
 	return 0;
 }
 
 static int eie_cpcm_close(struct snd_pcm_substream *substream)
 {
 	struct eie *eie = substream->private_data;
+	/* Ensure capture state is fully cleared when stream closes */
+	clear_bit(CAPTURE_RUNNING, &eie->states);
 	eie->cap_substream = NULL;
+	
+	/* If both playback and capture are now closed, clear all URB state bits */
+	if (!eie->play_substream) {
+		clear_bit(URBS_SUBMITTED, &eie->states);
+		clear_bit(URBS_FLOWING, &eie->states);
+	}
 	return 0;
 }
 

@@ -1,0 +1,1 @@
+savedcmd_/home/ema/.copilot/repos/copilot-worktrees/AKAI-EIE-Pro/emap77-fantastic-meme/akai_eie_pro.mod := printf '%s\n'   akai_eie_pro.o | awk '!x[$$0]++ { print("/home/ema/.copilot/repos/copilot-worktrees/AKAI-EIE-Pro/emap77-fantastic-meme/"$$0) }' > /home/ema/.copilot/repos/copilot-worktrees/AKAI-EIE-Pro/emap77-fantastic-meme/akai_eie_pro.mod
