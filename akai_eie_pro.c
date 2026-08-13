@@ -23,6 +23,11 @@ MODULE_AUTHOR("Enhanced by Jakob, based on Michal Rydlo <michal.rydlo@gmail.com>
 MODULE_LICENSE("GPL v2");
 MODULE_VERSION("1.0");
 
+/* Enable runtime debug logging: set via sysfs /sys/module/akai_eie_pro/parameters/eie_debug */
+static int eie_debug = 0;
+module_param_named(eie_debug, eie_debug, int, 0644);
+MODULE_PARM_DESC(eie_debug, "Enable debug logging (1=on)");
+
 static int index[SNDRV_CARDS] = SNDRV_DEFAULT_IDX;
 static char *id[SNDRV_CARDS] = SNDRV_DEFAULT_STR;
 static bool enable[SNDRV_CARDS] = SNDRV_DEFAULT_ENABLE_PNP;
@@ -42,6 +47,7 @@ enum {
 	PLAYBACK_RUNNING,
 	CAPTURE_RUNNING,
 	URBS_FLOWING,
+	URBS_SUBMITTED,
 	DISCONNECTED,
 };
 
@@ -293,6 +299,20 @@ static int send_magic_sequence(struct eie *eie, struct magic_seq *m, char *data)
 
 static unsigned int calc_frames_wanted(struct eie *eie)
 {
+	/* Hardware without a sync endpoint cannot provide timing feedback.
+	 * Keep the pacing strictly rate-based instead of mixing in stale/zero
+	 * feedback values, which creates audible "plucks"/distortion.
+	 */
+	if (!eie->sync_endpoint_addr) {
+		if (eie->rate == 44100)
+			return 220;
+		if (eie->rate == 48000)
+			return 240;
+		if (eie->rate == 96000)
+			return 480;
+		return (eie->rate * 5) / 1000;
+	}
+
 	/* More consistent frame calculation to avoid plucking */
 	if (eie->rate == 44100) {
 		/* 44.1kHz: alternate between 220 and 221 frames for smooth timing */
@@ -334,16 +354,30 @@ static int fill_playback_urb(struct eie_playback_urb *epu)
 	if (eie->play_substream && eie->play_substream->runtime)
 		frame_bytes = eie_frame_bytes(eie->play_substream->runtime);
 
-	/* Use hardware feedback if reasonable - stable tolerance */
-	if ((frames_elapsed > frames_wanted - 1)
-		&& (frames_elapsed < frames_wanted + 1)
-		&& frames_elapsed > 0) {
+	/* If no sync endpoint exists, never trust stale/zero feedback. Keep the
+	 * playback clock strictly rate-based to avoid audible drift/distortion.
+	 */
+	if (eie->sync_endpoint_addr &&
+	    (frames_elapsed > frames_wanted - 1)
+	    && (frames_elapsed < frames_wanted + 1)
+	    && frames_elapsed > 0) {
 		frames_wanted = frames_elapsed;
 	}
 	bytes_wanted = frame_bytes * frames_wanted;
 
 	if (bytes_wanted > urb->transfer_buffer_length)
 		return -EINVAL;
+
+	/* Optional debug: log play fragmentation decisions (limited) */
+	if (eie_debug) {
+		static int play_dbg_count = 0;
+		if (play_dbg_count < 50) {
+			unsigned int max_frames_per_pkt = eie->play_packet_size / frame_bytes;
+			dev_info(&eie->udev->dev, "play: frames_wanted=%u bytes_wanted=%u buf_len=%u pkt_size=%zu max_frames_pkt=%u",
+				frames_wanted, bytes_wanted, urb->transfer_buffer_length, eie->play_packet_size, max_frames_per_pkt);
+			play_dbg_count++;
+		}
+	}
 
 	if (test_bit(PLAYBACK_RUNNING, &eie->states)) {
 		runtime = eie->play_substream->runtime;
@@ -377,28 +411,46 @@ static int fill_playback_urb(struct eie_playback_urb *epu)
 		epu->silent = true;
 	}
 
-	/* Setup ISO frame descriptors with strict packet size validation */
+	/* Setup ISO frame descriptors with strict packet size validation.
+	 * Keep the packet sizes conservative so the device does not receive a
+	 * malformed descriptor schedule.
+	 */
 	{
 		unsigned int frames_filled = 0;
 		int i;
-		
+
 		for (i = 0; i < PLAY_PKT_CNT; i++) {
 			int len = frames_wanted * (i+1) / PLAY_PKT_CNT - frames_filled;
 			unsigned int pkt_bytes = len * frame_bytes;
-			
-			/* Clamp packet size to prevent overflow of transfer buffer */
+
+			if (len <= 0) {
+				urb->iso_frame_desc[i].offset = 0;
+				urb->iso_frame_desc[i].length = 0;
+				continue;
+			}
+
 			if (pkt_bytes > eie->play_packet_size) {
 				pkt_bytes = eie->play_packet_size;
 				len = pkt_bytes / frame_bytes;
 			}
-			
+
+			if (len <= 0) {
+				urb->iso_frame_desc[i].offset = 0;
+				urb->iso_frame_desc[i].length = 0;
+				continue;
+			}
+
 			urb->iso_frame_desc[i].offset = frames_filled * frame_bytes;
 			urb->iso_frame_desc[i].length = pkt_bytes;
 			frames_filled += len;
-			
-			/* Safety check: ensure we don't exceed total requested frames */
-			if (frames_filled > frames_wanted)
-				frames_filled = frames_wanted;
+
+			if (frames_filled >= frames_wanted)
+				break;
+		}
+
+		for (; i < PLAY_PKT_CNT; i++) {
+			urb->iso_frame_desc[i].offset = 0;
+			urb->iso_frame_desc[i].length = 0;
 		}
 	}
 
@@ -482,14 +534,23 @@ static void play_urb_complete(struct urb *urb)
 	bool elapsed = false;
 	bool abort = false;
 
+	/* Log status and sizes for debugging when enabled */
+	if (eie_debug) {
+		dev_info(&eie->udev->dev, "play_urb_complete: status=%d actual_len=%d epu_len=%u silent=%d",
+			urb->status, urb->actual_length, epu->len, epu->silent);
+	}
+
 	if (urb->status != 0) {
 		dev_dbg(&eie->udev->dev, "Play urb complete. %d", urb->status);
 		return;
 	}
 
 	/* first URB */
-	if (!test_and_set_bit(URBS_FLOWING, &eie->states))
+	if (!test_and_set_bit(URBS_FLOWING, &eie->states)) {
+		/* Clear the submitted flag when actual flow begins */
+		clear_bit(URBS_SUBMITTED, &eie->states);
 		wake_up(&eie->urbs_flow_wait);
+	}
 
 	spin_lock_irqsave(&eie->lock, flags);
 	if (!epu->silent
@@ -582,8 +643,17 @@ static void cap_urb_complete(struct urb *urb)
 				eie->cap_spill_len += take;
 				buf_idx += take;
 				bytes_available -= take;
-				
+			
 				if (eie->cap_spill_len == 64) {
+					/* Debug capture spill handling (limited) */
+					if (eie_debug) {
+						static int cap_dbg_count = 0;
+						if (cap_dbg_count < 100) {
+							dev_info(&eie->udev->dev, "cap: completed spill frame, urb_len=%u spill_len=%u",
+							urb->actual_length, eie->cap_spill_len);
+							cap_dbg_count++;
+						}
+					}
 					unsigned char *frame_buf = eie->cap_spill_buf;
 					/* decode frame_buf (exactly 64 bytes) */
 					int ch1 = 0, ch2 = 0, ch3 = 0, ch4 = 0;
@@ -799,6 +869,9 @@ static void sync_urb_complete(struct urb *urb)
 	int i;
 	int err;
 
+	if (!eie || !eie->sync_endpoint_addr)
+		return;
+
 	if (urb->status != 0) {
 		dev_dbg(&eie->udev->dev, "Sync urb complete. status = %d, packets = %d",
 			urb->status, urb->number_of_packets);
@@ -909,6 +982,19 @@ static int submit_init_play_urbs(struct eie *eie)
 
 	spin_lock_irqsave(&eie->lock, flags);
 
+	/* CRITICAL: Check and set the submission guard atomically (within spinlock).
+	 * This prevents the TOCTOU race where playback trigger and capture trigger
+	 * both see URBS_SUBMITTED=0 and both proceed to submit URBs concurrently.
+	 */
+	if (test_bit(URBS_FLOWING, &eie->states) || test_bit(URBS_SUBMITTED, &eie->states)) {
+		dev_warn(&eie->udev->dev, "submit_init_play_urbs: URBs already submitted or flowing");
+		spin_unlock_irqrestore(&eie->lock, flags);
+		return -EBUSY;
+	}
+
+	/* Atomically mark submission in progress before submitting any URBs */
+	set_bit(URBS_SUBMITTED, &eie->states);
+
 	for (i = 0; i < PLAY_URB_CNT; i++) {
 		/* init the urb state */
 		eie->play_urbs[i].silent = true;
@@ -920,9 +1006,18 @@ static int submit_init_play_urbs(struct eie *eie)
 		err = usb_submit_urb(eie->play_urbs[i].urb, GFP_ATOMIC);
 		if (err < 0)
 			goto out;
+		/* Limited debug: report first few successful submissions */
+		if (eie_debug && i < 4)
+			dev_info(&eie->udev->dev, "Submitted play urb %d (len=%u)", i, eie->play_urbs[i].len);
+	}
+
+	if (eie_debug) {
+		dev_info(&eie->udev->dev, "All play URBs submitted (count=%d)", PLAY_URB_CNT);
 	}
 
 out:
+	if (err < 0 && eie_debug)
+	dev_err(&eie->udev->dev, "submit_init_play_urbs failed: %d", err);
 	spin_unlock_irqrestore(&eie->lock, flags);
 	return err;
 }
@@ -965,25 +1060,31 @@ static int eie_ppcm_trigger(struct snd_pcm_substream *substream, int cmd)
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
-		/* Submit URBs when playback actually starts */
-		if (!test_bit(URBS_FLOWING, &eie->states)) {
-			if (eie->sync_endpoint_addr) {
-				err = submit_init_sync_urbs(eie);
-				if (err < 0)
-					return err;
-			}
-			err = submit_init_play_urbs(eie);
+		/* The stream must be marked active before the first fill so the initial
+		 * playback URBs are populated with audio instead of zero silence.
+		 */
+		set_bit(PLAYBACK_RUNNING, &eie->states);
+		/* State checks are now atomic inside submit_init_play_urbs().
+		 * Returns -EBUSY if URBs already submitted, which is OK (not an error).
+		 */
+		if (eie->sync_endpoint_addr) {
+			err = submit_init_sync_urbs(eie);
 			if (err < 0)
 				return err;
+		}
+		err = submit_init_play_urbs(eie);
+		if (err < 0 && err != -EBUSY)
+			return err;
+		/* Avoid sleeping in atomic context — caller may be in a locked syscall path
+		 * which triggers BUG: scheduling while atomic. Only wait if safe.
+		 */
+		if (!in_atomic()) {
 			err = eie_wait_for_urbs_flow(eie, 100);
 			if (err < 0)
 				return err;
-			
-			/* Small delay to let hardware stabilize and avoid initial plucks */
-			usleep_range(1000, 2000);  /* 1-2ms stabilization delay */
+		} else {
+			dev_warn(&eie->udev->dev, "Trigger: skipping wait for URBs due to atomic context");
 		}
-		
-		set_bit(PLAYBACK_RUNNING, &eie->states);
 		return 0;
 	case SNDRV_PCM_TRIGGER_STOP:
 		clear_bit(PLAYBACK_RUNNING, &eie->states);
@@ -1015,26 +1116,31 @@ static int eie_cpcm_trigger(struct snd_pcm_substream *substream, int cmd)
 			}
 		}
 		
-		/* CRITICAL: Device needs both playbook and capture URBs running for capture to work */
-		if (!test_bit(URBS_FLOWING, &eie->states)) {
-			/* Start playback URBs first */
-			if (eie->sync_endpoint_addr) {
-				err = submit_init_sync_urbs(eie);
-				if (err < 0) {
-					dev_err(&eie->udev->dev, "Failed to start sync URBs for capture: %d", err);
-					return err;
-				}
-			}
-			err = submit_init_play_urbs(eie);
+		/* CRITICAL: Device needs both playback and capture URBs running for capture to work.
+		 * State checks are now atomic inside submit_init_play_urbs().
+		 * Returns -EBUSY if URBs already submitted, which is OK (not an error).
+		 */
+		if (eie->sync_endpoint_addr) {
+			err = submit_init_sync_urbs(eie);
 			if (err < 0) {
-				dev_err(&eie->udev->dev, "Failed to start playbook URBs for capture: %d", err);
+				dev_err(&eie->udev->dev, "Failed to start sync URBs for capture: %d", err);
 				return err;
 			}
+		}
+		err = submit_init_play_urbs(eie);
+		if (err < 0 && err != -EBUSY) {
+			dev_err(&eie->udev->dev, "Failed to start playback URBs for capture: %d", err);
+			return err;
+		}
+		/* Avoid sleeping in atomic context — only wait when safe */
+		if (!in_atomic()) {
 			err = eie_wait_for_urbs_flow(eie, 100);
 			if (err < 0) {
 				dev_err(&eie->udev->dev, "Timed out waiting for playback URBs during capture start: %d", err);
 				return err;
 			}
+		} else {
+			dev_warn(&eie->udev->dev, "Capture trigger: skipping wait for URBs due to atomic context");
 		}
 		
 		set_bit(CAPTURE_RUNNING, &eie->states);
@@ -1146,8 +1252,9 @@ static void kill_all_urbs(struct eie *eie)
 			usb_kill_urb(urb);
 	}
 	
-	/* Clear the URBS_FLOWING state when URBs are killed */
+	/* Clear the URBS_FLOWING and SUBMITTED states when URBs are killed */
 	clear_bit(URBS_FLOWING, &eie->states);
+	clear_bit(URBS_SUBMITTED, &eie->states);
 }
 
 static void kill_and_free_urb(struct eie *eie, struct urb **urbp)
