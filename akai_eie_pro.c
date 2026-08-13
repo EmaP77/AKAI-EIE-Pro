@@ -384,13 +384,12 @@ static int fill_playback_urb(struct eie_playback_urb *epu)
 	if (eie->play_substream && eie->play_substream->runtime)
 		frame_bytes = eie_frame_bytes(eie->play_substream->runtime);
 
-	/* If no sync endpoint exists, never trust stale/zero feedback. Keep the
-	 * playback clock strictly rate-based to avoid audible drift/distortion.
+	/* Use the device's proprietary clock tick (EP 0x81) to match the exact
+	 * number of frames the hardware consumed. The EIE sends ~10-12 frames
+	 * per microframe; accept any reasonable value from the device.
+	 * Without sync, stay strictly rate-based to avoid drift.
 	 */
-	if (eie->sync_endpoint_addr &&
-	    (frames_elapsed > frames_wanted - 1)
-	    && (frames_elapsed < frames_wanted + 1)
-	    && frames_elapsed > 0) {
+	if (eie->sync_endpoint_addr && frames_elapsed > 0 && frames_elapsed < 600) {
 		frames_wanted = frames_elapsed;
 	}
 	bytes_wanted = frame_bytes * frames_wanted;
@@ -1432,12 +1431,15 @@ static int init_urbs(struct eie *eie)
 		endpoint = &iface_desc->endpoint[i].desc;
 
 		if (!eie->sync_endpoint_addr && usb_endpoint_is_isoc_in(endpoint)) {
-			/* Check if this is the sync endpoint (typically smaller) */
-			if (usb_endpoint_maxp(endpoint) < 64) {
-				err = init_sync_urbs(eie, endpoint);
-				if (err < 0)
-					return err;
-			}
+			/* EP 0x81 is the device clock endpoint: ISO IN, maxp=64.
+			 * Accept any ISO IN endpoint on this interface as the clock.
+			 * (The EIE Pro clock endpoint has maxp=64, not smaller.)
+			 */
+			dev_info(&eie->udev->dev, "Found clock endpoint: 0x%02x (maxp=%u)",
+				endpoint->bEndpointAddress, usb_endpoint_maxp(endpoint));
+			err = init_sync_urbs(eie, endpoint);
+			if (err < 0)
+				return err;
 		}
 		
 		/* Look specifically for endpoint 0x86 for capture */
