@@ -1109,14 +1109,9 @@ static int eie_cpcm_trigger(struct snd_pcm_substream *substream, int cmd)
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
-		/* Ensure device is configured for the current sample rate */
-		if (substream->runtime->rate != eie->rate) {
-			err = reset_eie(eie, substream->runtime->rate);
-			if (err < 0) {
-				dev_err(&eie->udev->dev, "Failed to configure device for capture: %d", err);
-				return err;
-			}
-		}
+		/* Rate changes are handled in eie_cpcm_prepare() which runs before trigger.
+		 * Never call reset_eie() here — it kills URBs submitted by the playback trigger.
+		 */
 		
 		/* CRITICAL: Device needs both playback and capture URBs running for capture to work.
 		 * State checks are now atomic inside submit_init_play_urbs().
