@@ -176,6 +176,7 @@ static int eie_set_alt_setting(struct eie *eie)
 
 static int eie_prepare_hw(struct snd_pcm_substream *substream)
 {
+	struct eie *eie = substream->private_data;
 	int err;
 
 	if (substream->stream == SNDRV_PCM_STREAM_CAPTURE)
@@ -185,6 +186,14 @@ static int eie_prepare_hw(struct snd_pcm_substream *substream)
 
 	err = snd_pcm_hw_constraint_minmax(substream->runtime,
 		SNDRV_PCM_HW_PARAM_BUFFER_TIME, 10*1000, UINT_MAX);
+	if (err < 0)
+		return err;
+
+	/* If a stream is already running at a fixed rate, constrain this one to match */
+	if (eie->rate)
+		err = snd_pcm_hw_constraint_single(substream->runtime,
+			SNDRV_PCM_HW_PARAM_RATE, eie->rate);
+
 	return err;
 }
 
@@ -454,8 +463,11 @@ static int eie_cpcm_prepare(struct snd_pcm_substream *substream)
 	if (err < 0)
 		return err;
 
+	/* Reset capture state under lock — also serves as xrun recovery */
+	spin_lock_irq(&eie->lock);
 	eie->cap_frames = 0;
 	eie->cap_buf_pos = 0;
+	spin_unlock_irq(&eie->lock);
 	substream->runtime->delay = 0;
 
 	/* Kill any previously running cap URBs before re-submitting */
@@ -933,7 +945,9 @@ static void cap_urb_complete(struct urb *urb)
 		unsigned int frames_rcvd = urb->actual_length / 64;
 		bool elapsed;
 		struct snd_pcm_runtime *runtime = eie->cap_substream->runtime;
+		unsigned long flags;
 
+		spin_lock_irqsave(&eie->lock, flags);
 		for (i = 0; i < frames_rcvd; i++) {
 			__le32 *out = (__le32 *) (runtime->dma_area + eie->cap_buf_pos * BYTES_PER_FRAME_CAP);
 
@@ -952,13 +966,14 @@ static void cap_urb_complete(struct urb *urb)
 			out[2] = __cpu_to_le32(ch3);
 			out[3] = __cpu_to_le32(ch4);
 		}
-
 		eie->cap_frames += frames_rcvd;
 		elapsed = eie->cap_frames > runtime->period_size;
-		if (elapsed) {
+		if (elapsed)
 			eie->cap_frames = 0;
+		spin_unlock_irqrestore(&eie->lock, flags);
+
+		if (elapsed)
 			snd_pcm_period_elapsed(eie->cap_substream);
-		}
 	}
 
 	/* Only resubmit if a capture stream is still open */
