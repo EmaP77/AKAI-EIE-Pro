@@ -1,1 +1,0 @@
-savedcmd_/home/ema/.copilot/repos/copilot-worktrees/AKAI-EIE-Pro/emap77-fantastic-meme/Module.symvers :=  scripts/mod/modpost -M -m       -o /home/ema/.copilot/repos/copilot-worktrees/AKAI-EIE-Pro/emap77-fantastic-meme/Module.symvers -n -T /home/ema/.copilot/repos/copilot-worktrees/AKAI-EIE-Pro/emap77-fantastic-meme/modules.order -i Module.symvers -e 
