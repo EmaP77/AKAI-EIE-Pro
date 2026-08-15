@@ -961,10 +961,11 @@ static void cap_urb_complete(struct urb *urb)
 				ch3 |= ((buf[64*i + j +  0] >> 1) & 1) << (23-j);
 				ch4 |= ((buf[64*i + j + 32] >> 1) & 1) << (23-j);
 			}
-			out[0] = __cpu_to_le32(ch1);
-			out[1] = __cpu_to_le32(ch2);
-			out[2] = __cpu_to_le32(ch3);
-			out[3] = __cpu_to_le32(ch4);
+			/* S32_LE is MSB-aligned: shift 24-bit value to bits 31-8 */
+			out[0] = __cpu_to_le32(ch1 << 8);
+			out[1] = __cpu_to_le32(ch2 << 8);
+			out[2] = __cpu_to_le32(ch3 << 8);
+			out[3] = __cpu_to_le32(ch4 << 8);
 		}
 		eie->cap_frames += frames_rcvd;
 		elapsed = eie->cap_frames > runtime->period_size;
